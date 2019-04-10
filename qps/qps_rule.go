@@ -3,9 +3,23 @@ package qps
 import (
 	"container/list"
 	"sync"
+	"time"
 )
 
 type RuleFunc func(interface{}) bool
+
+type QPSFresher struct {
+	interval        int64
+	lastRefreshTime int64
+}
+
+func (qf *QPSFresher) refresh(now int64) bool {
+	if now > qf.lastRefreshTime+qf.interval {
+		qf.lastRefreshTime = now
+		return true
+	}
+	return false
+}
 
 type QPSCounter struct {
 	mutex sync.RWMutex
@@ -41,9 +55,16 @@ func (c *QPSCounter) Reset() {
 	c.count = 0
 }
 
+func (c *QPSCounter) OverLimit() bool {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return c.count >= c.limit
+}
+
 type QPSRuleItem struct {
 	ruleFunc RuleFunc
 	counter  QPSCounter
+	fresher  QPSFresher
 }
 
 func (qri *QPSRuleItem) SetLimit(limit int64) {
@@ -51,11 +72,19 @@ func (qri *QPSRuleItem) SetLimit(limit int64) {
 }
 
 func (qri *QPSRuleItem) Pass(cond interface{}) bool {
-	isInRule := qri.ruleFunc(cond)
-	if isInRule {
-		return qri.counter.Add(1)
+	if nil != qri.ruleFunc {
+		isInRule := qri.ruleFunc(cond)
+		if !isInRule {
+			return false
+		}
 	}
-	return true
+	return qri.counter.Add(1)
+}
+
+func (qri *QPSRuleItem) fresh(now int64) {
+	if qri.fresher.refresh(now) {
+		qri.counter.Reset()
+	}
 }
 
 type QPSRule struct {
@@ -67,19 +96,42 @@ func (qr *QPSRule) Init() {
 	qr.ruleList = new(list.List)
 }
 
-func (qr *QPSRule) AddRule(rf RuleFunc,limit int64) {
+func (qr *QPSRule) addRule(rf RuleFunc, limit int64, duration time.Duration) {
 	qr.mutex.Lock()
 	defer qr.mutex.Unlock()
-	qr.ruleList.PushBack(&QPSRuleItem{ruleFunc: rf,counter:QPSCounter{limit:limit}})
+	if 0 == duration {
+		duration = time.Second
+	}
+	qr.ruleList.PushBack(
+		&QPSRuleItem{
+			ruleFunc: rf,
+			counter: QPSCounter{
+				limit: limit,
+			},
+			fresher: QPSFresher{
+				interval:        int64(duration),
+				lastRefreshTime: time.Now().UnixNano(),
+			},
+		},
+	)
 }
 
-func (qr *QPSRule) Pass(cond interface{}) bool {
+func (qr *QPSRule) pass(cond interface{}) bool {
 	qr.mutex.Lock()
 	defer qr.mutex.Unlock()
 	for i := qr.ruleList.Front(); nil != i; i = i.Next() {
 		if !i.Value.(*QPSRuleItem).Pass(cond) {
 			return false
 		}
+	}
+	return true
+}
+
+func (qr *QPSRule) refresh(now int64) bool {
+	qr.mutex.Lock()
+	defer qr.mutex.Unlock()
+	for i := qr.ruleList.Front(); nil != i; i = i.Next() {
+		i.Value.(*QPSRuleItem).fresh(now)
 	}
 	return true
 }
